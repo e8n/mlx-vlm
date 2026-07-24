@@ -1675,6 +1675,7 @@ def test_speculative_server_prefill_threads_qwen_dflash_prompt_kwargs(monkeypatc
                     "image_grid_thw": mx.array([[1, 2, 3]], dtype=mx.int32),
                     "_apc_image_hash": 123,
                     "_apc_tenant": "tenant-a",
+                    "_apc_derived_sequence_inputs": True,
                 },
             },
             {
@@ -1693,6 +1694,7 @@ def test_speculative_server_prefill_threads_qwen_dflash_prompt_kwargs(monkeypatc
     assert call["inputs_embeds"].tolist()[1][0] == [0.0, 0.0, 0.0, 0.0]
     assert "_apc_image_hash" not in call
     assert "_apc_tenant" not in call
+    assert "_apc_derived_sequence_inputs" not in call
 
 
 def test_responses_endpoint_forwards_new_sampling_args(client):
@@ -6051,6 +6053,7 @@ class TestResponseGenerator:
 
         assert "position_ids" not in gen_kwargs
         assert "rope_deltas" not in gen_kwargs
+        assert gen_kwargs["_apc_derived_sequence_inputs"] is True
 
     def test_gpu_embed_prefers_image_ref_for_apc_hash(self):
         class Embed:
