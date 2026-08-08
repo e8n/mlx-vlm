@@ -356,6 +356,30 @@ class KVCache(_BaseCache):
     def make_mask(self, *args, **kwargs):
         return create_attention_mask(*args, offset=self.offset, **kwargs)
 
+    def extract(self, idx):
+        """
+        Return row `idx` as a standalone single-row cache.
+
+        Batch-aware caches carry this so APC can snapshot one sequence out of a
+        batch (BatchKVCache.extract), and CacheList.extract fans out to every
+        sub-cache it holds. A plain KVCache lands in a CacheList for hybrid
+        models that pair attention with a recurrent state — Inkling's
+        make_cache() returns CacheList(KVCache(), ArraysCache(4)) per layer — so
+        without this the whole composite is unsnapshottable and APC raises
+        AttributeError on the first store, before it ever caches anything.
+
+        Trimmed to `offset` like `state` is: keys/values are over-allocated in
+        `step`-sized blocks, and a snapshot that kept the zero padding would
+        restore it as real key/value content.
+        """
+        cache = KVCache()
+        if self.keys is None:
+            return cache
+        cache.keys = mx.contiguous(self.keys[idx : idx + 1, :, : self.offset])
+        cache.values = mx.contiguous(self.values[idx : idx + 1, :, : self.offset])
+        cache.offset = cache.keys.shape[2]
+        return cache
+
     @classmethod
     def merge(_, caches):
         return BatchKVCache.merge(caches)

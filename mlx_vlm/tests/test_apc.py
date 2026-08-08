@@ -305,6 +305,51 @@ def test_exact_batch_cache_merge_and_extract_supports_arrays_and_kv():
     assert extracted[1].offset == 12
 
 
+def test_extract_composite_cache_pairing_kv_with_arrays_state():
+    """Hybrid models pair attention with a recurrent state inside a CacheList.
+
+    Inkling's make_cache() is CacheList(KVCache(), ArraysCache(4)) per layer.
+    CacheList.extract fans out to every sub-cache, so a KVCache without extract
+    made the whole composite unsnapshottable and APC died with AttributeError on
+    its first store — before caching anything, i.e. every turn re-prefilled.
+    """
+    from mlx_vlm.models.cache import ArraysCache, CacheList, KVCache
+
+    arrays = ArraysCache(size=1)
+    arrays.cache = [mx.full((1, 3, 5), 7.0, dtype=mx.float32)]
+    kv = KVCache()
+    # Go through update_and_fetch so keys/values carry the real `step`-sized
+    # over-allocation; a hand-built array would hide the trimming bug.
+    kv.update_and_fetch(
+        mx.full((1, 1, 12, 4), 1.0, dtype=mx.float32),
+        mx.full((1, 1, 12, 4), 2.0, dtype=mx.float32),
+    )
+    assert kv.keys.shape[2] > kv.offset, "expected step-sized over-allocation"
+    composite = CacheList(kv, arrays)
+
+    extracted = composite.extract(0)
+
+    assert isinstance(extracted, CacheList)
+    assert isinstance(extracted[0], KVCache)
+    assert isinstance(extracted[1], ArraysCache)
+    # Trimmed to offset: the zero padding must not survive as real KV content.
+    assert extracted[0].keys.shape == (1, 1, 12, 4)
+    assert extracted[0].offset == 12
+    _assert_allclose(extracted[0].keys, mx.full((1, 1, 12, 4), 1.0, dtype=mx.float32))
+    _assert_allclose(extracted[0].values, mx.full((1, 1, 12, 4), 2.0, dtype=mx.float32))
+    _assert_allclose(extracted[1].cache[0], arrays.cache[0])
+
+
+def test_extract_empty_kv_cache_yields_empty_cache():
+    """A cold layer must extract to an empty cache, not raise on None keys."""
+    from mlx_vlm.models.cache import KVCache
+
+    extracted = KVCache().extract(0)
+
+    assert extracted.empty()
+    assert extracted.offset == 0
+
+
 def test_single_row_prompt_batch_exact_checkpoint_stores_without_extract():
     from mlx_vlm.generate.ar import PromptProcessingBatch
     from mlx_vlm.models.cache import ArraysCache, KVCache, RotatingKVCache
