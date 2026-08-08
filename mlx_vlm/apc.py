@@ -485,8 +485,11 @@ def adjust_prefix_to_text_suffix_boundary(
     )
     if max_len <= 0:
         return 0
-    desired = max(1, int(desired_prefix_len))
-    prefix_len = max(desired, media_safe_prefix_min(token_ids, media_token_ids))
+    desired = int(desired_prefix_len)
+    media_min = media_safe_prefix_min(token_ids, media_token_ids)
+    if desired <= 0 and media_min <= 0:
+        return 0
+    prefix_len = max(desired, media_min)
     if prefix_len > max_len:
         return 0
     return prefix_len
@@ -4135,9 +4138,15 @@ def apc_lookup_plan(
     if not ids_list or n < 2:
         return None
 
+    # Exact entries at or below the guard are degenerate: a 1-token match still
+    # sets ``reused_prefix_len > 0``, which suppresses every later checkpoint
+    # (checkpoints are only installed on a cold miss). Require exact hits to
+    # clear the guard so a short first prompt cannot poison the tenant.
+    exact_lookup_min = max(safe_lookup_min, manager.exact_cache_guard_tokens)
+
     if apc_mode == "exact":
         exact_cache, exact_prefix_len = manager.lookup_exact_cache(
-            ids_list, extra_hash=extra_hash, min_prefix_tokens=safe_lookup_min
+            ids_list, extra_hash=extra_hash, min_prefix_tokens=exact_lookup_min
         )
         if exact_cache is not None and 0 < exact_prefix_len < n:
             if not suffix_is_text_only(exact_prefix_len):
@@ -4162,7 +4171,7 @@ def apc_lookup_plan(
         exact_cache, exact_prefix_len = manager.lookup_exact_cache(
             ids_list,
             extra_hash=extra_hash,
-            min_prefix_tokens=max(prefix_len, safe_lookup_min),
+            min_prefix_tokens=max(prefix_len, exact_lookup_min),
         )
     warm_cache = None
     disk_prefix_len = 0
