@@ -914,11 +914,18 @@ def apply_chat_template(
                 last_user_idx = i
             elif (rc := _get_role_content(p)) is not None:
                 role, content = rc
-                if role not in ("system", "assistant", "tool"):
+                if role in ("system", "assistant"):
+                    # Their content is flattened to text, so any marker on them
+                    # never renders and must not consume an image.
+                    continue
+                if role != "tool":
                     last_user_idx = i
-                    explicit_image_counts[i] = _content_media_count(
-                        content, ("image", "image_url", "input_image")
-                    )
+                # Tool messages are passed through verbatim, so a marker in
+                # their content is rendered by the template itself. Count it so
+                # the same image is not *also* placed on the last user message.
+                explicit_image_counts[i] = _content_media_count(
+                    content, ("image", "image_url", "input_image")
+                )
 
         def _allocate_media_counts(explicit_counts, total_count):
             remaining = total_count

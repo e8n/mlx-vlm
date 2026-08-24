@@ -293,13 +293,20 @@ def _anthropic_content_blocks_to_text_and_tools(
     role: str,
     content: Union[str, List[Any]],
     images: List[str],
-) -> Tuple[str, List[Dict[str, Any]], List[Dict[str, Any]]]:
+) -> Tuple[str, List[Dict[str, Any]], List[Dict[str, Any]], int]:
+    """Split Anthropic content blocks into text, tool calls and tool results.
+
+    The fourth element is how many images this turn attached directly (i.e. not
+    through a tool_result). The caller needs it to keep those images on this
+    turn instead of letting them drift to whatever turn happens to be last.
+    """
     if isinstance(content, str):
-        return content, [], []
+        return content, [], [], 0
 
     text_parts: List[str] = []
     tool_calls: List[Dict[str, Any]] = []
     tool_results: List[Dict[str, Any]] = []
+    direct_images = 0
     for raw_item in content or []:
         item = _as_plain_dict(raw_item)
         if not isinstance(item, dict):
@@ -316,6 +323,7 @@ def _anthropic_content_blocks_to_text_and_tools(
             image_ref = _anthropic_image_source_to_ref(item.get("source"))
             if image_ref:
                 images.append(image_ref)
+                direct_images += 1
         elif item_type == "tool_use" and role == "assistant":
             tool_calls.append(_anthropic_tool_use_to_openai(item))
         elif item_type == "tool_result" and role == "user":
@@ -334,7 +342,7 @@ def _anthropic_content_blocks_to_text_and_tools(
         elif item.get("text"):
             text_parts.append(str(item["text"]))
 
-    return "\n".join(text_parts).strip(), tool_calls, tool_results
+    return "\n".join(text_parts).strip(), tool_calls, tool_results, direct_images
 
 
 def _anthropic_messages_to_internal(
@@ -350,16 +358,24 @@ def _anthropic_messages_to_internal(
         processed_messages.append({"role": "system", "content": system_text})
 
     for message in request.messages:
-        content_text, tool_calls, tool_results = (
+        content_text, tool_calls, tool_results, direct_images = (
             _anthropic_content_blocks_to_text_and_tools(
                 message.role, message.content, images
             )
         )
-        if content_text or tool_calls or not tool_results:
+        if content_text or tool_calls or direct_images or not tool_results:
             msg: Dict[str, Any] = {"role": message.role, "content": content_text}
+            if direct_images:
+                # Keep a marker per image so the chat template renders the
+                # placeholder on this turn. Without it every image is moved to
+                # the last user turn on every request, which misattributes the
+                # image and permanently defeats prefix caching.
+                msg["content"] = [{"type": "text", "text": content_text}] + [
+                    {"type": "image"}
+                ] * direct_images
             if tool_calls:
                 msg["tool_calls"] = tool_calls
-                if not content_text:
+                if not content_text and not direct_images:
                     msg["content"] = None
             processed_messages.append(msg)
         processed_messages.extend(tool_results)

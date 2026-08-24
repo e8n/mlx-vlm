@@ -3620,9 +3620,17 @@ def test_anthropic_messages_endpoint_maps_text_and_images(client, monkeypatch):
         "cache_read_input_tokens": 0,
         "output_tokens": 4,
     }
+    # The image keeps a marker on the turn it arrived on so the chat template
+    # renders its placeholder there instead of on whatever turn is last.
     assert mock_template.call_args.args[2] == [
         {"role": "system", "content": "You are concise."},
-        {"role": "user", "content": "Describe it."},
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Describe it."},
+                {"type": "image"},
+            ],
+        },
     ]
     assert mock_generate.call_args.kwargs["image"] == ["https://example.com/image.png"]
     assert mock_generate.call_args.kwargs["max_tokens"] == 12
@@ -6674,3 +6682,260 @@ class TestCountThinkingTagTokens:
 
     def test_no_tags(self):
         assert server._count_thinking_tag_tokens("plain text") == 0
+
+
+def _chat_prompt(client, messages):
+    """Run /chat/completions with a real chat template and return the prompt."""
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+    result = GenerationResult(
+        text="done",
+        prompt_tokens=8,
+        generation_tokens=4,
+        total_tokens=12,
+    )
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(server, "generate", return_value=result) as mock_generate,
+    ):
+        response = client.post(
+            "/chat/completions",
+            json={"model": "demo", "messages": messages},
+        )
+
+    assert response.status_code == 200, response.text
+    return (
+        mock_generate.call_args.kwargs["prompt"],
+        mock_generate.call_args.kwargs.get("image"),
+    )
+
+
+def test_chat_completions_keeps_image_on_its_own_turn(client, monkeypatch):
+    """A conversation that grows past an image stays prefix-stable.
+
+    Regression test: every request used to re-render the whole history with the
+    image attached to the *latest* user turn, so the image drifted forward one
+    turn at a time. That both misattributed the image and permanently defeated
+    the prompt cache, because the previous turn's prompt was no longer a prefix
+    of the next one.
+    """
+    monkeypatch.setattr(server.runtime, "response_generator", None)
+    image_url = "data:image/png;base64,ZmFrZS1pbWFnZQ=="
+    conversation = [
+        {"role": "user", "content": "turn one"},
+        {"role": "assistant", "content": "reply one"},
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "look at this"},
+                {"type": "image_url", "image_url": {"url": image_url}},
+            ],
+        },
+        {"role": "assistant", "content": "reply two"},
+        {"role": "user", "content": "turn three"},
+    ]
+
+    image_turn_prompt, images = _chat_prompt(client, conversation[:3])
+    assert images == [image_url]
+    assert image_url not in image_turn_prompt
+    assert "look at this<image>" in image_turn_prompt
+
+    later_prompt, images = _chat_prompt(client, conversation)
+    assert images == [image_url]
+    # The image stayed on the turn that carried it...
+    assert "look at this<image>" in later_prompt
+    assert "turn three<image>" not in later_prompt
+    # ...so the earlier prompt is still a prefix of the later one.
+    assert later_prompt.startswith(image_turn_prompt)
+
+
+def test_chat_completions_keeps_multiple_images_on_their_own_turns(client, monkeypatch):
+    """Images from different turns do not pile up on the last user turn."""
+    monkeypatch.setattr(server.runtime, "response_generator", None)
+    first = "data:image/png;base64,Zmlyc3Q="
+    second = "data:image/png;base64,c2Vjb25k"
+    conversation = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "first image"},
+                {"type": "image_url", "image_url": {"url": first}},
+            ],
+        },
+        {"role": "assistant", "content": "ok"},
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "second image"},
+                {"type": "image_url", "image_url": {"url": second}},
+            ],
+        },
+    ]
+
+    prompt, images = _chat_prompt(client, conversation)
+    assert images == [first, second]
+    assert "first image<image>" in prompt
+    assert "second image<image>" in prompt
+    assert "<image><image>" not in prompt
+
+
+def test_chat_completions_tool_choice_required_keeps_image_turn_instruction(
+    client, monkeypatch
+):
+    """tool_choice='required' still reaches the last user turn when it has an image."""
+    monkeypatch.setattr(server.runtime, "response_generator", None)
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+    result = GenerationResult(
+        text="done",
+        prompt_tokens=8,
+        generation_tokens=4,
+        total_tokens=12,
+    )
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(server, "generate", return_value=result) as mock_generate,
+    ):
+        response = client.post(
+            "/chat/completions",
+            json={
+                "model": "demo",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "look at this"},
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": "data:image/png;base64,ZmFrZS1pbWFnZQ=="
+                                },
+                            },
+                        ],
+                    }
+                ],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {"name": "noop", "parameters": {}},
+                    }
+                ],
+                "tool_choice": "required",
+            },
+        )
+
+    assert response.status_code == 200, response.text
+    prompt = mock_generate.call_args.kwargs["prompt"]
+    assert "must call one or more of the available functions" in prompt
+    assert "look at this" in prompt
+    assert "<image>" in prompt
+
+
+def _anthropic_prompt(client, messages, tools=None):
+    """Run /v1/messages with a real chat template and return the prompt."""
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+    result = GenerationResult(
+        text="done",
+        prompt_tokens=8,
+        generation_tokens=4,
+        total_tokens=12,
+    )
+    body = {"model": "demo", "max_tokens": 16, "messages": messages}
+    if tools:
+        body["tools"] = tools
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(server, "generate", return_value=result) as mock_generate,
+    ):
+        response = client.post("/v1/messages", json=body)
+
+    assert response.status_code == 200, response.text
+    return (
+        mock_generate.call_args.kwargs["prompt"],
+        mock_generate.call_args.kwargs.get("image"),
+    )
+
+
+_ANTHROPIC_IMAGE_BLOCK = {
+    "type": "image",
+    "source": {"type": "base64", "media_type": "image/png", "data": "aW1n"},
+}
+
+
+def test_anthropic_messages_keeps_image_on_its_own_turn(client, monkeypatch):
+    """/v1/messages must not drag the image to the newest turn either."""
+    monkeypatch.setattr(server.runtime, "response_generator", None)
+    conversation = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "look at this"},
+                _ANTHROPIC_IMAGE_BLOCK,
+            ],
+        },
+        {"role": "assistant", "content": [{"type": "text", "text": "I see it"}]},
+        {"role": "user", "content": [{"type": "text", "text": "how many regions"}]},
+    ]
+
+    prompt, images = _anthropic_prompt(client, conversation)
+    assert images == ["data:image/png;base64,aW1n"]
+    assert "look at this<image>" in prompt
+    assert "how many regions<image>" not in prompt
+    assert prompt.count("<image>") == 1
+
+
+def test_anthropic_messages_tool_result_image_is_placed_once(client, monkeypatch):
+    """A tool_result image renders at the tool result, and only there.
+
+    The marker the converter leaves on the ``role: "tool"`` message is rendered
+    by the template itself, so it must also be counted — otherwise the same
+    image gets a second placeholder on the last user turn and the placeholder
+    count no longer matches the images that were actually sent.
+    """
+    monkeypatch.setattr(server.runtime, "response_generator", None)
+    conversation = [
+        {"role": "user", "content": [{"type": "text", "text": "screenshot please"}]},
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "sure"},
+                {"type": "tool_use", "id": "toolu_1", "name": "shot", "input": {}},
+            ],
+        },
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_1",
+                    "content": [
+                        {"type": "text", "text": "here"},
+                        _ANTHROPIC_IMAGE_BLOCK,
+                    ],
+                }
+            ],
+        },
+    ]
+
+    prompt, images = _anthropic_prompt(
+        client,
+        conversation,
+        tools=[{"name": "shot", "input_schema": {"type": "object"}}],
+    )
+    assert images == ["data:image/png;base64,aW1n"]
+    assert prompt.count("<image>") == 1
+    assert "here<image>" in prompt
+    assert "screenshot please<image>" not in prompt

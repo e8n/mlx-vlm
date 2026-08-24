@@ -11,7 +11,7 @@ import uuid
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
-from typing import Any, List, Optional, Tuple
+from typing import Any, List, Optional, Tuple, Union
 
 import mlx.core as mx
 from fastapi import HTTPException, Request
@@ -137,6 +137,25 @@ def _content_has_effective_input(content: Any) -> bool:
     return bool(str(content).strip())
 
 
+def _text_with_image_markers(text: str, image_count: int) -> Union[str, List[Any]]:
+    """Keep a bare image marker per image collected from this message.
+
+    The image payloads themselves travel in the request-level ``images`` list,
+    but ``apply_chat_template`` still needs to know *which* message each one
+    came from: without a marker it falls back to piling every placeholder onto
+    the last user message, so the same image drifts to a later position on every
+    turn of a multi-turn conversation. That both misrepresents the conversation
+    to the model and breaks prefix caching permanently, because the previous
+    turn's prompt stops being a prefix of the current one.
+
+    Messages without images keep their plain string content so nothing else
+    changes shape.
+    """
+    if image_count <= 0:
+        return text
+    return [{"type": "text", "text": text}] + [{"type": "image"}] * image_count
+
+
 def _message_has_effective_input(message: Any) -> bool:
     if hasattr(message, "model_dump"):
         message = message.model_dump(exclude_none=True)
@@ -179,8 +198,30 @@ def _with_tool_choice_instruction(messages, instruction: str):
         messages[0]["content"] = f"{content}\n\n{instruction}".strip()
     user_instruction_added = False
     for message in reversed(messages):
-        if message.get("role") == "user" and isinstance(message.get("content"), str):
-            message["content"] = f"{message['content']}\n\n{instruction}".strip()
+        if message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            message["content"] = f"{content}\n\n{instruction}".strip()
+            user_instruction_added = True
+            break
+        # A user turn carrying images keeps its content as parts; append to its
+        # text part so the instruction still lands on the last user message.
+        if isinstance(content, list):
+            content = [
+                dict(part) if isinstance(part, dict) else part for part in content
+            ]
+            for part in content:
+                if isinstance(part, dict) and part.get("type") in (
+                    "text",
+                    "input_text",
+                ):
+                    text = part.get("text") or ""
+                    part["text"] = f"{text}\n\n{instruction}".strip()
+                    break
+            else:
+                content.insert(0, {"type": "text", "text": instruction})
+            message["content"] = content
             user_instruction_added = True
             break
     if not user_instruction_added and not (
@@ -1631,6 +1672,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
             if isinstance(message.content, str):
                 msg["content"] = message.content
             elif isinstance(message.content, list):
+                message_images = 0
                 if message.role == "user":
                     for item in message.content:
                         if not isinstance(item, dict):
@@ -1638,15 +1680,19 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                         item_type = item.get("type")
                         if item_type == "input_image":
                             images.append(item["image_url"])
+                            message_images += 1
                         elif item_type == "image_url":
                             images.append(item["image_url"]["url"])
+                            message_images += 1
                         elif item_type == "input_audio":
                             audio.append(_decode_input_audio_data(item["input_audio"]))
                         elif item_type in ("input_video", "video_url", "video"):
                             video = _extract_video_reference(item)
                             if video:
                                 videos.append(video)
-                msg["content"] = extract_text_from_content(message.content)
+                msg["content"] = _text_with_image_markers(
+                    extract_text_from_content(message.content), message_images
+                )
             else:
                 msg["content"] = message.content
 

@@ -762,3 +762,120 @@ class TestModelSpecificPromptContracts:
             "text",
         ]
         assert result[0]["content"][-1]["text"] == "OCR:"
+
+
+def _return_messages(prompt, num_images, model_type="qwen2_vl"):
+    return apply_chat_template(
+        None,
+        {"model_type": model_type},
+        prompt,
+        num_images=num_images,
+        return_messages=True,
+    )
+
+
+def _image_part_indices(messages):
+    """Index of every message that carries an image placeholder part."""
+    indices = []
+    for i, message in enumerate(messages):
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        if any(
+            isinstance(part, dict)
+            and part.get("type") in ("image", "input_image", "image_url")
+            for part in content
+        ):
+            indices.append(i)
+    return indices
+
+
+def test_apply_chat_template_keeps_image_on_its_own_turn():
+    """An image marker keeps its placeholder on the turn it arrived on.
+
+    Regression test: the placeholder used to be moved to the last user message
+    on every request, so a growing conversation re-rendered its own history
+    differently each turn (breaking both meaning and prefix caching).
+    """
+    conversation = [
+        {"role": "user", "content": "turn one"},
+        {"role": "assistant", "content": "reply one"},
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "look at this"},
+                {"type": "image"},
+            ],
+        },
+        {"role": "assistant", "content": "reply two"},
+        {"role": "user", "content": "turn three"},
+    ]
+
+    # Same image, one turn later: the placeholder must not move.
+    assert _image_part_indices(_return_messages(conversation[:3], 1)) == [2]
+    assert _image_part_indices(_return_messages(conversation, 1)) == [2]
+
+    # ...and the earlier turns must render identically both times.
+    short = _return_messages(conversation[:3], 1)
+    long = _return_messages(conversation, 1)
+    assert long[: len(short)] == short
+
+
+def test_apply_chat_template_distributes_images_across_turns():
+    """Images on different turns each stay on their own turn."""
+    conversation = [
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": "first"}, {"type": "image"}],
+        },
+        {"role": "assistant", "content": "ok"},
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "second"},
+                {"type": "image"},
+                {"type": "image"},
+            ],
+        },
+    ]
+
+    messages = _return_messages(conversation, 3)
+    assert _image_part_indices(messages) == [0, 2]
+    image_counts = [
+        sum(
+            1
+            for part in messages[i]["content"]
+            if isinstance(part, dict) and part.get("type") == "image"
+        )
+        for i in (0, 2)
+    ]
+    assert image_counts == [1, 2]
+
+
+def test_apply_chat_template_falls_back_to_last_user_without_markers():
+    """Side-channel images with no markers keep the legacy placement."""
+    conversation = [
+        {"role": "user", "content": "look at this"},
+        {"role": "assistant", "content": "ok"},
+        {"role": "user", "content": "and now"},
+    ]
+
+    assert _image_part_indices(_return_messages(conversation, 1)) == [2]
+
+
+def test_apply_chat_template_marker_surplus_goes_to_last_user():
+    """More markers than images never invents placeholders for missing images."""
+    conversation = [
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": "first"}, {"type": "image"}],
+        },
+        {"role": "assistant", "content": "ok"},
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": "second"}, {"type": "image"}],
+        },
+    ]
+
+    # Only one image actually reached the server.
+    assert _image_part_indices(_return_messages(conversation, 1)) == [0]
