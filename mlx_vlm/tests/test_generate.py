@@ -186,6 +186,36 @@ def test_batch_generator_apc_media_token_ids_handles_text_only_model(mock_proces
     assert generator._apc_media_token_ids() == set()
 
 
+def test_batch_generator_apc_media_token_ids_uses_vlm_config(mock_processor):
+    """The media guards need the VLM config, not the language model's.
+
+    Regression test: the server builds BatchGenerator from
+    ``model.language_model``, whose TextConfig has no ``image_token_id``. The
+    guards therefore saw an empty media-token set and silently did nothing on
+    every vision model.
+    """
+    language_model = MockLanguageModel()
+    language_model.config = SimpleNamespace()
+    model = SimpleNamespace(
+        language_model=language_model,
+        config=SimpleNamespace(image_token_id=200054, video_token_id=200055),
+        make_cache=lambda: [KVCache()],
+    )
+    generator = ar_module.BatchGenerator(
+        model.language_model,
+        mock_processor,
+        apc_manager=apc_module.APCManager(num_blocks=1),
+        media_config=model.config,
+    )
+
+    assert generator._apc_media_token_ids() == {200054, 200055}
+    # ...and the guard derived from it now actually constrains the prefix.
+    ids = [1, 2, 200054, 200054, 3, 4]
+    assert generator._apc_safe_prefix_lookup_min(ids) == 3
+    assert generator._apc_suffix_is_text_only(ids, 4) is True
+    assert generator._apc_suffix_is_text_only(ids, 2) is False
+
+
 # ============================================================================
 # Tests for Dataclasses
 # ============================================================================

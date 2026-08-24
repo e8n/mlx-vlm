@@ -1732,6 +1732,7 @@ class ResponseGenerator:
                         batch_gen = BatchGenerator(
                             self.model.language_model,
                             self.processor,
+                            media_config=getattr(self.model, "config", None),
                             stop_tokens=self.stop_tokens,
                             sampler=self._make_sampler(args),
                             kv_bits=self.kv_bits,

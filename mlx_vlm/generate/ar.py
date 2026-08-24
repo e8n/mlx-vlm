@@ -2151,8 +2151,14 @@ class BatchGenerator:
         draft_kind: Optional[str] = None,
         draft_block_size: Optional[int] = None,
         greedy_sampling: bool = False,
+        media_config=None,
     ):
         self.model = model
+        # Callers hand us ``model.language_model``, whose TextConfig carries no
+        # image/video token ids. Keep the top-level VLM config too, or the APC
+        # media guards below see an empty token set and quietly do nothing on
+        # every vision model.
+        self.media_config = media_config
         self.max_tokens = max_tokens
         self.processor = processor
         self.kv_bits = kv_bits
@@ -2245,10 +2251,18 @@ class BatchGenerator:
         )
 
     def _apc_media_token_ids(self) -> set[int]:
-        config = getattr(self.model, "config", None)
-        if config is None:
-            return set()
-        return _apc.multimodal_token_ids_from_config(config)
+        cached = getattr(self, "_apc_media_token_ids_cache", None)
+        if cached is not None:
+            return cached
+        ids: set[int] = set()
+        for config in (
+            getattr(self.model, "config", None),
+            getattr(self, "media_config", None),
+        ):
+            if config is not None:
+                ids |= _apc.multimodal_token_ids_from_config(config)
+        self._apc_media_token_ids_cache = ids
+        return ids
 
     def _apc_safe_prefix_lookup_min(self, ids_list: List[int]) -> int:
         safe_min = _apc.media_safe_prefix_min(ids_list, self._apc_media_token_ids())
@@ -3116,6 +3130,7 @@ def _generate_batch(
         prefill_batch_size=batch_size,
         completion_batch_size=batch_size,
         compute_logprobs=False,
+        media_config=getattr(model, "config", None),
         **kwargs,
     )
 
