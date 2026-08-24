@@ -9,7 +9,17 @@ import time
 import warnings
 from collections.abc import Generator
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    List,
+    NamedTuple,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+)
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -567,6 +577,7 @@ APC_PRIVATE_PROMPT_KEYS = (
     "_apc_tenant",
     "_apc_image_hash",
     "_apc_semantic_hash",
+    "_apc_media_hashes",
 )
 
 
@@ -661,6 +672,20 @@ def _concat_prompt_kwarg_rows(key: str, rows: List[mx.array]) -> mx.array:
     ):
         return mx.concatenate([_mrope_position_ids_row(row) for row in rows], axis=1)
     return mx.concatenate(rows, axis=0)
+
+
+class _APCKey(NamedTuple):
+    """How one prompt is keyed in APC, and whether media may sit in the suffix."""
+
+    token_ids: List[int]
+    extra_hash: int
+    media_in_suffix_ok: bool
+
+
+def _apc_store_ids(meta: dict) -> List[int]:
+    """Token sequence an APC harvest should key by (media-aware when built)."""
+    key_ids = meta.get("key_ids")
+    return key_ids if key_ids else meta["full_input_ids"]
 
 
 def _merge_prefill_prompt_kwargs(
@@ -1730,20 +1755,31 @@ class PromptProcessingBatch:
             return True
         return self._inputs_embeds.shape[1] > self.prefill_step_size
 
+    def _apc_pending_checkpoint(self, meta: dict) -> Optional[Tuple[int, bool]]:
+        """Next checkpoint this row still has to snapshot, shortest first."""
+        if self._apc_mode != "exact":
+            return None
+        prefix_len = int(meta.get("prefix_len", 0) or 0)
+        done = meta.setdefault("checkpoints_done", set())
+        for checkpoint in meta.get("checkpoints") or ():
+            length = checkpoint[0]
+            if length in done:
+                continue
+            if length <= prefix_len:
+                # Already inside the restored prefix; nothing left to snapshot.
+                done.add(length)
+                continue
+            return checkpoint
+        return None
+
     def _apc_checkpoint_column_for_meta(
         self, batch_idx: int, meta: dict
     ) -> Optional[int]:
-        checkpoint_len = int(meta.get("checkpoint_len") or 0)
-        if (
-            self._apc_mode != "exact"
-            or checkpoint_len <= 0
-            or meta.get("checkpoint_done")
-        ):
+        pending = self._apc_pending_checkpoint(meta)
+        if pending is None:
             return None
+        checkpoint_len = pending[0]
         prefix_len = int(meta.get("prefix_len", 0) or 0)
-        if checkpoint_len <= prefix_len:
-            meta["checkpoint_done"] = True
-            return None
         if self._right_pad_per_row is not None:
             suffix_checkpoint = checkpoint_len - prefix_len
             if suffix_checkpoint >= self._suffix_lens[batch_idx]:
@@ -1792,22 +1828,23 @@ class PromptProcessingBatch:
         if self._apc_manager is None or self._apc_mode != "exact":
             return
         for batch_idx, meta in enumerate(self._apc_meta):
-            if meta is None or meta.get("checkpoint_done"):
+            if meta is None:
                 continue
-            checkpoint_len = int(meta.get("checkpoint_len") or 0)
-            if checkpoint_len <= 0:
-                continue
-            if self._row_real_tokens_processed(batch_idx) != checkpoint_len:
-                continue
-            prompt_cache = self._apc_prompt_cache_for_store(batch_idx)
-            if prompt_cache is None:
-                continue
-            self._apc_manager.store_exact_cache(
-                meta["full_input_ids"][:checkpoint_len],
-                prompt_cache,
-                extra_hash=meta.get("extra_hash", 0),
-            )
-            meta["checkpoint_done"] = True
+            processed = self._row_real_tokens_processed(batch_idx)
+            done = meta.setdefault("checkpoints_done", set())
+            for checkpoint_len, boundary in meta.get("checkpoints") or ():
+                if checkpoint_len in done or processed != checkpoint_len:
+                    continue
+                prompt_cache = self._apc_prompt_cache_for_store(batch_idx)
+                if prompt_cache is None:
+                    continue
+                self._apc_manager.store_exact_cache(
+                    _apc_store_ids(meta)[:checkpoint_len],
+                    prompt_cache,
+                    extra_hash=meta.get("extra_hash", 0),
+                    boundary=boundary,
+                )
+                done.add(checkpoint_len)
 
     def _prompt_kwargs_for_step(self, n: Optional[int] = None) -> dict:
         if n is None or not self._prompt_length_aware_keys:
@@ -2040,7 +2077,7 @@ class PromptProcessingBatch:
                         prompt_cache = self._apc_prompt_cache_for_store(batch_idx)
                         if prompt_cache is not None:
                             self._apc_manager.store_exact_cache(
-                                meta["full_input_ids"],
+                                _apc_store_ids(meta),
                                 prompt_cache,
                                 extra_hash=meta.get("extra_hash", 0),
                             )
@@ -2049,7 +2086,7 @@ class PromptProcessingBatch:
                         _apc.commit_prefix_blocks(
                             self._apc_manager,
                             self.prompt_cache,
-                            meta["full_input_ids"],
+                            _apc_store_ids(meta),
                             batch_idx=batch_idx,
                             extra_hash=meta.get("extra_hash", 0),
                             skip_first_n_tokens=meta.get("prefix_len", 0),
@@ -2264,11 +2301,57 @@ class BatchGenerator:
         self._apc_media_token_ids_cache = ids
         return ids
 
-    def _apc_safe_prefix_lookup_min(self, ids_list: List[int]) -> int:
+    def _apc_key_for(
+        self, ids_list: Sequence[int], prompt_kwargs: Optional[dict]
+    ) -> "_APCKey":
+        """Resolve how APC should key this prompt.
+
+        When the request carries one hash per image placeholder span, media
+        identity moves into the key tokens (see ``media_prefix_key_ids``) and
+        the server has already left it out of the flat salt. Both halves must
+        stay in sync: if the spans do not line up, the identity is folded back
+        into the salt here so two different images can never key alike.
+        """
+        extra_hash = self._apc_extra_hash(prompt_kwargs or {})
+        hashes = (prompt_kwargs or {}).get("_apc_media_hashes")
+        if not hashes:
+            return _APCKey(list(ids_list), extra_hash, False)
+        key_ids = _apc.media_prefix_key_ids(
+            ids_list, self._apc_media_token_ids(), hashes
+        )
+        if key_ids is None:
+            return _APCKey(
+                list(ids_list), _apc.fold_media_hashes(extra_hash, hashes), False
+            )
+        # Per-span keys make a prefix that stops before an image well-defined.
+        # Whether it can actually be *restored* is a separate question: the
+        # suffix embeddings are sliced out of the full-prompt inputs_embeds and
+        # already carry image features, but any other prompt kwarg the model
+        # indexes by media item would still describe the whole prompt.
+        media_in_suffix_ok = _apc.prompt_kwargs_allow_media_in_suffix(
+            prompt_kwargs,
+            len(ids_list),
+            is_sequence_aligned=_is_sequence_aligned_prompt_kwarg,
+            ignored_keys=self._APC_PRIVATE_KEYS,
+        )
+        return _APCKey(key_ids, extra_hash, media_in_suffix_ok)
+
+    def _apc_safe_prefix_lookup_min(
+        self, ids_list: List[int], allow_media_in_suffix: bool = False
+    ) -> int:
+        if allow_media_in_suffix:
+            return 0
         safe_min = _apc.media_safe_prefix_min(ids_list, self._apc_media_token_ids())
         return max(0, safe_min - 1)
 
-    def _apc_suffix_is_text_only(self, ids_list: List[int], prefix_len: int) -> bool:
+    def _apc_suffix_is_text_only(
+        self,
+        ids_list: List[int],
+        prefix_len: int,
+        allow_media_in_suffix: bool = False,
+    ) -> bool:
+        if allow_media_in_suffix:
+            return True
         return _apc.prefix_leaves_text_only_suffix(
             ids_list,
             prefix_len,
@@ -2276,41 +2359,88 @@ class BatchGenerator:
         )
 
     def _apc_prefix_has_media_tokens(
-        self, ids_list: List[int], prefix_len: int
+        self,
+        ids_list: List[int],
+        prefix_len: int,
+        allow_media_in_suffix: bool = False,
     ) -> bool:
+        if allow_media_in_suffix:
+            return False
         return _apc.prefix_contains_media_tokens(
             ids_list,
             prefix_len,
             self._apc_media_token_ids(),
         )
 
-    def _apc_exact_checkpoint_len(self, ids_list: List[int]) -> int:
+    def _apc_exact_checkpoints(
+        self, ids_list: Sequence[int], media_in_suffix_ok: bool
+    ) -> Tuple[Tuple[int, bool], ...]:
+        """Prefix lengths worth snapshotting during this prefill.
+
+        Always the guarded near-full prefix, which lets an identical prompt
+        re-sent later hit (a stored entry has to be a *strict* prefix to match).
+        Plus, once media identity is in the key, the conversation head that
+        predates every image: dropping an image from the history rewrites the
+        prompt from that image onward, and this is the only checkpoint that
+        survives it.
+        """
         if self.apc_manager is None or getattr(self, "apc_mode", "block") != "exact":
-            return 0
-        return _apc.adjust_prefix_to_text_suffix_boundary(
+            return ()
+        max_len = len(ids_list) - 1
+        checkpoints: List[Tuple[int, bool]] = []
+        guarded = _apc.adjust_prefix_to_text_suffix_boundary(
             ids_list,
             len(ids_list) - self.apc_manager.exact_cache_guard_tokens,
             self._apc_media_token_ids(),
-            max_prefix_tokens=len(ids_list) - 1,
+            max_prefix_tokens=max_len,
         )
+        if guarded > 0:
+            checkpoints.append((guarded, False))
+        if media_in_suffix_ok:
+            spans = _apc.media_token_spans(ids_list, self._apc_media_token_ids())
+            # Back off from the span: chat templates wrap placeholders in a few
+            # markup tokens that disappear along with the image, so a snapshot
+            # ending flush against the span is invalidated by exactly the edit
+            # it exists to survive. Measured on Inkling the divergence sits one
+            # token ahead of the span; the guard is the slack already used for
+            # the same purpose on the near-full checkpoint.
+            head = (
+                spans[0][0] - self.apc_manager.exact_cache_guard_tokens if spans else 0
+            )
+            if 0 < head < max_len and all(head != c for c, _ in checkpoints):
+                checkpoints.append((head, True))
+        return tuple(sorted(checkpoints))
 
-    def _apc_pick_for(self, sequence) -> Optional[dict]:
+    def _apc_pick_for(
+        self, sequence, key: Optional["_APCKey"] = None
+    ) -> Optional[dict]:
         """Look up an APC prefix for ``sequence``. Returns dict with matched
         blocks + suffix metadata when there is a usable hit, else None.
+
+        ``key`` is the row's resolved APC key; callers that already built one
+        pass it in so the salt is not recomputed (hashing it can mean hashing
+        the whole prompt embedding).
         """
         if self.apc_manager is None:
             return None
         uid, ids_list, max_toks, prompt_kwargs, lps, criteria = sequence
         if not ids_list or len(ids_list) < 2:
             return None
+        if key is None:
+            key = self._apc_key_for(ids_list, prompt_kwargs)
+        media_ok = key.media_in_suffix_ok
         return _apc.apc_lookup_plan(
             self.apc_manager,
-            ids_list,
-            extra_hash=self._apc_extra_hash(prompt_kwargs or {}),
+            key.token_ids,
+            extra_hash=key.extra_hash,
             apc_mode=getattr(self, "apc_mode", "block"),
-            safe_lookup_min=self._apc_safe_prefix_lookup_min(ids_list),
-            suffix_is_text_only=lambda pl: self._apc_suffix_is_text_only(ids_list, pl),
-            prefix_has_media=lambda pl: self._apc_prefix_has_media_tokens(ids_list, pl),
+            safe_lookup_min=self._apc_safe_prefix_lookup_min(ids_list, media_ok),
+            suffix_is_text_only=lambda pl: self._apc_suffix_is_text_only(
+                ids_list, pl, media_ok
+            ),
+            prefix_has_media=lambda pl: self._apc_prefix_has_media_tokens(
+                ids_list, pl, media_ok
+            ),
         )
 
     def _build_mixed_prompt_batch(
@@ -2329,7 +2459,10 @@ class BatchGenerator:
         if self.apc_manager is None:
             return None
 
-        picks: List[Optional[dict]] = [self._apc_pick_for(s) for s in sequences]
+        apc_keys = [self._apc_key_for(s[1], s[3]) for s in sequences]
+        picks: List[Optional[dict]] = [
+            self._apc_pick_for(s, key) for s, key in zip(sequences, apc_keys)
+        ]
         any_warm = any(p is not None for p in picks)
         if not any_warm:
             return None  # caller falls back to cold-only path
@@ -2441,14 +2574,16 @@ class BatchGenerator:
         apc_meta = [
             {
                 "full_input_ids": full_ids[i],
+                "key_ids": apc_keys[i].token_ids,
                 "prefix_len": prefix_lens[i],
                 "extra_hash": (
-                    picks[i]["extra_hash"]
-                    if picks[i]
-                    else self._apc_extra_hash(prompt_kwargs_list[i] or {})
+                    picks[i]["extra_hash"] if picks[i] else apc_keys[i].extra_hash
                 ),
                 "apc_blocks": picks[i].get("matched_blocks", []) if picks[i] else [],
-                "checkpoint_len": self._apc_exact_checkpoint_len(full_ids[i]),
+                "checkpoints": self._apc_exact_checkpoints(
+                    full_ids[i], apc_keys[i].media_in_suffix_ok
+                ),
+                "checkpoints_done": set(),
             }
             for i in range(len(sequences))
         ]
@@ -2496,14 +2631,18 @@ class BatchGenerator:
             return None
         meta: List[Optional[dict]] = []
         for ids_list, kw in zip(input_ids_list, prompt_kwargs_list):
-            extra_hash = self._apc_extra_hash(kw or {})
+            key = self._apc_key_for(ids_list, kw)
             meta.append(
                 {
                     "full_input_ids": list(ids_list),
+                    "key_ids": key.token_ids,
                     "prefix_len": 0,
-                    "extra_hash": extra_hash,
+                    "extra_hash": key.extra_hash,
                     "apc_blocks": [],
-                    "checkpoint_len": self._apc_exact_checkpoint_len(list(ids_list)),
+                    "checkpoints": self._apc_exact_checkpoints(
+                        ids_list, key.media_in_suffix_ok
+                    ),
+                    "checkpoints_done": set(),
                 }
             )
         return meta

@@ -2982,3 +2982,141 @@ class TestBatchTurboQuantizedKVStart:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+def _media_apc_batch_generator(manager, image_token_id):
+    bg = object.__new__(BatchGenerator)
+    bg.apc_manager = manager
+    bg.apc_mode = "block"
+    bg.model = SimpleNamespace(config=SimpleNamespace(image_token_id=image_token_id))
+    bg._wire_stack = None
+    return bg
+
+
+def test_apc_pick_reuses_prefix_that_predates_an_appended_image():
+    """Adding an image must not cold-start the conversation before it.
+
+    Regression for spec 20260824-04 §4.3: the flat image salt hashed the whole
+    request's media set, so every prompt that introduced or dropped an image
+    keyed differently from every earlier turn and refilled from token 0.
+    """
+    block_size = 4
+    image_token_id = 99
+    semantic_hash = 4242
+    text_prefix = [1, 2, 3, 4, 5, 6, 7, 8]
+    with_image = [*text_prefix, 9, image_token_id, image_token_id, 10]
+
+    manager = apc_module.APCManager(num_blocks=8, block_size=block_size)
+    layer_keys = [mx.ones((1, 1, len(text_prefix), 2))]
+    layer_values = [mx.ones((1, 1, len(text_prefix), 2)) * 2]
+    stored = manager.store_kv_blocks(
+        text_prefix, layer_keys, layer_values, extra_hash=semantic_hash
+    )
+    manager.release(stored)
+
+    bg = _media_apc_batch_generator(manager, image_token_id)
+    pick = bg._apc_pick_for(
+        (
+            1,
+            with_image,
+            1,
+            {
+                "_apc_semantic_hash": semantic_hash,
+                "_apc_media_hashes": (777,),
+                "inputs_embeds": mx.zeros((1, len(with_image), 2)),
+            },
+            [],
+            None,
+        )
+    )
+
+    assert pick is not None
+    assert pick["prefix_len"] == len(text_prefix)
+    manager.release(pick["matched_blocks"])
+
+
+def test_apc_pick_keeps_media_guard_when_prompt_kwargs_are_not_sliceable():
+    """The suffix may hold media only when every other kwarg survives slicing.
+
+    ``deepstack_visual_embeds`` is indexed by counting visual positions in the
+    current forward pass, so a prefix that swallows part of the media leaves it
+    describing the wrong images.
+    """
+    block_size = 4
+    image_token_id = 99
+    semantic_hash = 4242
+    text_prefix = [1, 2, 3, 4, 5, 6, 7, 8]
+    with_image = [*text_prefix, 9, image_token_id, image_token_id, 10]
+
+    manager = apc_module.APCManager(num_blocks=8, block_size=block_size)
+    layer_keys = [mx.ones((1, 1, len(text_prefix), 2))]
+    layer_values = [mx.ones((1, 1, len(text_prefix), 2)) * 2]
+    stored = manager.store_kv_blocks(
+        text_prefix, layer_keys, layer_values, extra_hash=semantic_hash
+    )
+    manager.release(stored)
+
+    bg = _media_apc_batch_generator(manager, image_token_id)
+    pick = bg._apc_pick_for(
+        (
+            1,
+            with_image,
+            1,
+            {
+                "_apc_semantic_hash": semantic_hash,
+                "_apc_media_hashes": (777,),
+                "inputs_embeds": mx.zeros((1, len(with_image), 2)),
+                "deepstack_visual_embeds": mx.zeros((3, 2, 2)),
+            },
+            [],
+            None,
+        )
+    )
+
+    assert pick is None
+    assert all(block.ref_cnt == 0 for block in stored)
+
+
+def test_apc_key_folds_media_back_into_the_salt_when_spans_do_not_line_up():
+    """Two images must never key alike just because the manifest was unusable.
+
+    The server drops image identity from the salt as soon as it hands over
+    per-image hashes, so the fallback path has to put it back.
+    """
+    image_token_id = 99
+    token_ids = [1, image_token_id, 2, image_token_id, 3]
+    manager = apc_module.APCManager(num_blocks=4, block_size=4)
+    bg = _media_apc_batch_generator(manager, image_token_id)
+
+    plain = bg._apc_key_for(token_ids, {"_apc_semantic_hash": 11})
+    one = bg._apc_key_for(
+        token_ids, {"_apc_semantic_hash": 11, "_apc_media_hashes": (777,)}
+    )
+    other = bg._apc_key_for(
+        token_ids, {"_apc_semantic_hash": 11, "_apc_media_hashes": (888,)}
+    )
+
+    # Two spans, one hash: the manifest cannot be mapped.
+    assert one.token_ids == token_ids
+    assert one.media_in_suffix_ok is False
+    assert one.extra_hash != plain.extra_hash
+    assert one.extra_hash != other.extra_hash
+
+
+def test_apc_exact_checkpoints_add_a_media_boundary_snapshot():
+    image_token_id = 99
+    token_ids = [*range(40), image_token_id, image_token_id, *range(40, 60)]
+    manager = apc_module.APCManager(num_blocks=8, block_size=4)
+    manager.exact_cache_guard_tokens = 16
+    bg = _media_apc_batch_generator(manager, image_token_id)
+    bg.apc_mode = "exact"
+
+    without_media = bg._apc_exact_checkpoints(token_ids, False)
+    with_media = bg._apc_exact_checkpoints(token_ids, True)
+
+    assert all(not boundary for _length, boundary in without_media)
+    boundaries = [length for length, boundary in with_media if boundary]
+    # One boundary snapshot, backed off from the span so the template markup
+    # that disappears with the image is not part of the stored prefix.
+    assert boundaries == [40 - manager.exact_cache_guard_tokens]
+    assert with_media[0][0] < with_media[-1][0]

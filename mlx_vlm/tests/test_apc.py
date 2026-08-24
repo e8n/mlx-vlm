@@ -380,7 +380,8 @@ def test_single_row_prompt_batch_exact_checkpoint_stores_without_extract():
         {
             "full_input_ids": token_ids,
             "prefix_len": 0,
-            "checkpoint_len": len(token_ids),
+            "checkpoints": ((len(token_ids), False),),
+            "checkpoints_done": set(),
             "extra_hash": 0,
         }
     ]
@@ -389,7 +390,7 @@ def test_single_row_prompt_batch_exact_checkpoint_stores_without_extract():
 
     batch._store_apc_exact_checkpoints()
 
-    assert batch._apc_meta[0]["checkpoint_done"] is True
+    assert batch._apc_meta[0]["checkpoints_done"] == {len(token_ids)}
     assert batch._apc_manager.stats_snapshot()["exact_stores"] == 1
 
 
@@ -1303,3 +1304,125 @@ def test_exact_disk_hit_promotion_with_nonzero_extra_hash(tmp_path, monkeypatch)
     assert warm_wrong is None
 
     manager.close()
+
+
+def test_media_prefix_key_ids_keeps_earlier_image_stable_when_one_is_appended():
+    image_token = 99
+    with_a = [1, 2, image_token, image_token, 3, 4]
+    with_ab = [*with_a, 5, image_token, image_token, 6]
+
+    keys_a = apc_module.media_prefix_key_ids(with_a, {image_token}, [111])
+    keys_ab = apc_module.media_prefix_key_ids(with_ab, {image_token}, [111, 222])
+
+    assert keys_a is not None and keys_ab is not None
+    # The whole prefix that predates the second image keys identically, which
+    # is what lets the conversation before it stay reusable.
+    assert keys_ab[: len(with_a)] == keys_a
+    # The two images key differently even though their placeholders are equal.
+    assert keys_ab[2:4] != keys_ab[7:9]
+
+
+def test_media_prefix_key_ids_tracks_image_identity_and_span_length():
+    image_token = 99
+    token_ids = [1, image_token, image_token, 2]
+
+    same = apc_module.media_prefix_key_ids(token_ids, {image_token}, [111])
+    other = apc_module.media_prefix_key_ids(token_ids, {image_token}, [222])
+    longer = apc_module.media_prefix_key_ids(
+        [1, image_token, image_token, image_token, 2], {image_token}, [111]
+    )
+
+    assert same is not None and other is not None and longer is not None
+    assert same[1:3] != other[1:3]
+    assert same[1:3] != longer[1:3]
+    # Text positions are untouched.
+    assert same[0] == 1 and same[3] == 2
+
+
+def test_media_prefix_key_ids_are_int32_safe_and_above_vocabulary():
+    image_token = 99
+    keys = apc_module.media_prefix_key_ids([image_token], {image_token}, [111])
+
+    assert keys is not None
+    assert all(1 << 30 <= k < 1 << 31 for k in keys)
+    # _sequence_hash packs token tuples as int32; anything wider would raise.
+    apc_module._sequence_hash(keys, 0, 16)
+
+
+def test_media_prefix_key_ids_declines_when_spans_and_hashes_disagree():
+    image_token = 99
+    token_ids = [1, image_token, 2, image_token, 3]
+
+    assert apc_module.media_prefix_key_ids(token_ids, {image_token}, [111]) is None
+    assert apc_module.media_prefix_key_ids(token_ids, set(), [111]) is None
+    assert apc_module.media_prefix_key_ids([1, 2, 3], {image_token}, []) is None
+
+
+def test_fold_media_hashes_separates_media_sets():
+    base = 17
+
+    assert apc_module.fold_media_hashes(base, []) == base
+    assert apc_module.fold_media_hashes(base, [1]) != base
+    assert apc_module.fold_media_hashes(base, [1]) != apc_module.fold_media_hashes(
+        base, [1, 2]
+    )
+
+
+def test_prompt_kwargs_allow_media_in_suffix_only_for_sliceable_kwargs():
+    def is_aligned(key, value, sequence_length):
+        return value.ndim >= 2 and value.shape[1] == sequence_length
+
+    embeds = mx.zeros((1, 8, 2))
+
+    assert apc_module.prompt_kwargs_allow_media_in_suffix(
+        {"inputs_embeds": embeds, "_apc_tenant": "t"},
+        8,
+        is_sequence_aligned=is_aligned,
+        ignored_keys=("_apc_tenant",),
+    )
+    # Sequence-aligned allowlisted kwarg: sliced to the suffix, so still fine.
+    assert apc_module.prompt_kwargs_allow_media_in_suffix(
+        {"inputs_embeds": embeds, "attention_mask": mx.ones((1, 8))},
+        8,
+        is_sequence_aligned=is_aligned,
+    )
+    # deepstack features are indexed by visual position count, not by sequence
+    # position, so they desynchronise once the prefix swallows part of the media.
+    assert not apc_module.prompt_kwargs_allow_media_in_suffix(
+        {"inputs_embeds": embeds, "deepstack_visual_embeds": mx.zeros((3, 4, 2))},
+        8,
+        is_sequence_aligned=is_aligned,
+    )
+    # Allowlisted but not actually sequence-aligned: it would not get sliced.
+    assert not apc_module.prompt_kwargs_allow_media_in_suffix(
+        {"inputs_embeds": embeds, "attention_mask": mx.ones((1, 4))},
+        8,
+        is_sequence_aligned=is_aligned,
+    )
+
+
+def test_exact_cache_budgets_media_boundary_entries_separately():
+    from mlx_vlm.models.cache import KVCache
+
+    manager = apc_module.APCManager(num_blocks=8, block_size=4)
+    manager._exact_cache_max = 2
+    manager._exact_boundary_max = 1
+
+    def store(token_ids, boundary):
+        cache = [KVCache()]
+        cache[0].keys = mx.ones((1, 1, len(token_ids), 2))
+        cache[0].values = mx.ones((1, 1, len(token_ids), 2))
+        cache[0].offset = len(token_ids)
+        return manager.store_exact_cache(token_ids, cache, boundary=boundary)
+
+    store(list(range(4)), True)
+    for turn in range(4):
+        store(list(range(8 + turn)), False)
+        store(list(range(9 + turn)), False)
+
+    entries = list(manager._exact_cache.values())
+    assert sum(1 for e in entries if e.boundary) == 1
+    assert sum(1 for e in entries if not e.boundary) == 2
+    # The boundary head survives every ordinary turn's churn — the turn that
+    # needs it is the one where an image leaves the history, much later.
+    assert [e for e in entries if e.boundary][0].token_ids == tuple(range(4))

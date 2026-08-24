@@ -771,7 +771,7 @@ def test_server_serves_ar_requests_after_drafter_mismatch(monkeypatch):
         "mlx_vlm.speculative.drafters.load_drafter",
         lambda *_args, **_kwargs: (drafter, "mtp"),
     )
-    gen._gpu_embed = lambda raw_inputs, images=None, apc_semantic_hash=None: (
+    gen._gpu_embed = lambda raw_inputs, images=None, **apc_kwargs: (
         mx.array([[raw_inputs["token"]]], dtype=mx.int32),
         {},
     )
@@ -1578,8 +1578,8 @@ def _run_speculative_prefill_once(monkeypatch, *, draft_kind, request_specs):
 
     specs_iter = iter(request_specs)
 
-    def fake_gpu_embed(raw_inputs, images=None, apc_semantic_hash=None):
-        del raw_inputs, images, apc_semantic_hash
+    def fake_gpu_embed(raw_inputs, images=None, **apc_kwargs):
+        del raw_inputs, images, apc_kwargs
         spec = next(specs_iter)
         return spec["input_ids"], spec["gen_kwargs"]
 
@@ -5140,7 +5140,7 @@ class TestResponseGenerator:
             gen.tokenizer = SimpleNamespace()
 
         gen._initialize_model = fake_initialize_model
-        gen._gpu_embed = lambda raw_inputs, images=None, apc_semantic_hash=None: (
+        gen._gpu_embed = lambda raw_inputs, images=None, **apc_kwargs: (
             mx.array([[raw_inputs["request_id"]]], dtype=mx.int32),
             {},
         )
@@ -5296,7 +5296,7 @@ class TestResponseGenerator:
 
         gen._initialize_model = fake_initialize_model
         gen._run_speculative = lambda: pytest.fail("MTP should use BatchGenerator")
-        gen._gpu_embed = lambda raw_inputs, images=None, apc_semantic_hash=None: (
+        gen._gpu_embed = lambda raw_inputs, images=None, **apc_kwargs: (
             mx.array([[raw_inputs["request_id"]]], dtype=mx.int32),
             {},
         )
@@ -5477,7 +5477,7 @@ class TestResponseGenerator:
             gen.tokenizer = SimpleNamespace()
 
         gen._initialize_model = fake_initialize_model
-        gen._gpu_embed = lambda raw_inputs, images=None, apc_semantic_hash=None: (
+        gen._gpu_embed = lambda raw_inputs, images=None, **apc_kwargs: (
             mx.array([[raw_inputs["request_id"]]], dtype=mx.int32),
             {},
         )
@@ -6939,3 +6939,68 @@ def test_anthropic_messages_tool_result_image_is_placed_once(client, monkeypatch
     assert prompt.count("<image>") == 1
     assert "here<image>" in prompt
     assert "screenshot please<image>" not in prompt
+
+
+def _media_hash_generator(image_token_id=99):
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    gen.model = SimpleNamespace(config=SimpleNamespace(image_token_id=image_token_id))
+    return gen
+
+
+def test_apc_media_hashes_returns_one_hash_per_placeholder_span():
+    gen = _media_hash_generator()
+    raw_inputs = {
+        "input_ids": mx.array([[1, 99, 99, 2, 3, 99, 4]]),
+        "pixel_values": mx.zeros((2, 3, 4, 4)),
+    }
+
+    hashes = gen._apc_media_hashes(raw_inputs, ["data:a", "data:b"])
+
+    assert hashes == [
+        hash_image_payload(image_ref="data:a"),
+        hash_image_payload(image_ref="data:b"),
+    ]
+
+
+def test_apc_media_hashes_declines_when_the_mapping_is_not_one_per_image():
+    gen = _media_hash_generator()
+    pixel_values = mx.zeros((2, 3, 4, 4))
+
+    # Two images but a single merged span: the order cannot be recovered.
+    assert (
+        gen._apc_media_hashes(
+            {"input_ids": mx.array([[1, 99, 99, 2]]), "pixel_values": pixel_values},
+            ["data:a", "data:b"],
+        )
+        is None
+    )
+    # Audio or video share the image placeholder on some models, so spans stop
+    # being one-per-image.
+    assert (
+        gen._apc_media_hashes(
+            {
+                "input_ids": mx.array([[1, 99, 2, 99, 3]]),
+                "pixel_values": pixel_values,
+                "pixel_values_videos": mx.zeros((1, 3, 4, 4)),
+            },
+            ["data:a", "data:b"],
+        )
+        is None
+    )
+    assert gen._apc_media_hashes({"input_ids": mx.array([[1, 2]])}, []) is None
+
+
+def test_apc_media_hashes_declines_without_media_token_ids():
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    gen.model = SimpleNamespace(config=SimpleNamespace())
+
+    assert (
+        gen._apc_media_hashes(
+            {
+                "input_ids": mx.array([[1, 99, 2]]),
+                "pixel_values": mx.zeros((1, 3, 4, 4)),
+            },
+            ["data:a"],
+        )
+        is None
+    )

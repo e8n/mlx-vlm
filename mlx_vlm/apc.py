@@ -430,6 +430,113 @@ def media_token_spans(
     return tuple(spans)
 
 
+# Media key tokens live above every real vocabulary id and inside int32 so
+# ``_sequence_hash`` can keep packing token tuples as int32.
+_MEDIA_KEY_TOKEN_BASE = 1 << 30
+_MEDIA_KEY_TOKEN_MASK = (1 << 30) - 1
+
+
+def media_prefix_key_ids(
+    token_ids: Sequence[int],
+    media_token_ids: Iterable[int],
+    media_hashes: Sequence[int],
+) -> Optional[List[int]]:
+    """Rewrite media placeholders into per-item key tokens, or ``None`` if unmappable.
+
+    APC keys a prefix by its token tuple plus one flat ``extra_hash`` salt.
+    Placeholder tokens are identical for every image, so the tuple alone cannot
+    say *which* image sits where, and the flat salt hashes the whole request's
+    media set at once: appending or dropping any image changes it and throws
+    away every prefix that predates the change, however far back it starts.
+
+    Folding each item's hash into its own placeholder tokens moves media
+    identity into the token tuple, where prefix comparison already lives. A
+    prefix that ends before image B is then keyed identically whether or not B
+    is appended later, so the conversation up to B stays reusable.
+
+    Returns ``None`` when the spans and the hashes do not line up one-to-one;
+    callers keep the conservative whole-set salt in that case.
+    """
+    hashes = [int(h) for h in media_hashes]
+    spans = media_token_spans(token_ids, media_token_ids)
+    if not spans or len(spans) != len(hashes):
+        return None
+    key_ids = [int(t) for t in token_ids]
+    for (start, end), item_hash in zip(spans, hashes):
+        # Span length rides along so a preprocessing change that alters the
+        # patch count changes the key even when the source reference does not.
+        span_key = _stable_int_hash(item_hash, end - start)
+        for idx in range(start, end):
+            mixed = _stable_int_hash(span_key, int(token_ids[idx]))
+            key_ids[idx] = _MEDIA_KEY_TOKEN_BASE | (mixed & _MEDIA_KEY_TOKEN_MASK)
+    return key_ids
+
+
+def fold_media_hashes(extra_hash: int, media_hashes: Sequence[int]) -> int:
+    """Fold a whole media set back into a flat salt.
+
+    Used when per-item key tokens could not be built after the salt had already
+    dropped image identity: without this the two images of a swapped-out prompt
+    would key identically.
+    """
+    folded = int(extra_hash)
+    for item_hash in media_hashes:
+        folded = _stable_int_hash(folded, int(item_hash))
+    return folded
+
+
+# Prompt kwargs that stay correct when an APC-restored prefix leaves media
+# placeholder tokens in the suffix.
+#
+# Two properties are needed at once: the tensor is sequence-aligned, so the
+# generic suffix slicing in ``generate/ar.py`` cuts it down to the suffix; and
+# its per-position values do not depend on how many media items preceded that
+# position. Anything else -- notably ``deepstack_visual_embeds``, which model
+# code indexes by counting visual positions in the *current* forward pass --
+# desynchronises as soon as the prefix swallows part of the media, so those
+# requests keep the conservative guard below.
+MEDIA_SUFFIX_SAFE_PROMPT_KWARGS = frozenset(
+    {
+        "attention_mask",
+        "mm_token_type_ids",
+        "pos_hw",
+        "position_ids",
+        "token_type_ids",
+    }
+)
+
+
+def prompt_kwargs_allow_media_in_suffix(
+    prompt_kwargs: Optional[Dict[str, Any]],
+    sequence_length: int,
+    *,
+    is_sequence_aligned,
+    ignored_keys: Iterable[str] = (),
+) -> bool:
+    """Whether a media-bearing suffix can be prefilled from these prompt kwargs.
+
+    The suffix embeddings are sliced out of the full-prompt ``inputs_embeds``,
+    which already has image features merged in at their placeholder positions,
+    so media inside the suffix is embedded correctly on its own. The risk is
+    the *other* prompt kwargs: any that the model indexes by media item rather
+    than by sequence position would still describe the whole prompt.
+
+    Returns True only when every remaining kwarg is on the allowlist above and
+    is actually sequence-aligned at ``sequence_length`` (so it gets sliced).
+    """
+    skip = set(ignored_keys) | {"inputs_embeds"}
+    for key, value in (prompt_kwargs or {}).items():
+        if key in skip or value is None:
+            continue
+        if key not in MEDIA_SUFFIX_SAFE_PROMPT_KWARGS:
+            return False
+        if not isinstance(value, mx.array) or not is_sequence_aligned(
+            key, value, sequence_length
+        ):
+            return False
+    return True
+
+
 def media_safe_prefix_min(
     token_ids: Sequence[int],
     media_token_ids: Iterable[int],
@@ -533,6 +640,9 @@ class APCExactCacheEntry:
     extra_hash: int
     prompt_cache: List[Any]
     last_used: float
+    # A media-boundary snapshot: the conversation head that predates every
+    # image. Budgeted apart from ordinary snapshots (see _evict_exact_entries).
+    boundary: bool = False
 
 
 @dataclass(frozen=True)
@@ -2862,6 +2972,9 @@ class APCManager:
         self._exact_cache_max = max(
             0, int(os.environ.get("APC_EXACT_CACHE_ENTRIES", "2"))
         )
+        self._exact_boundary_max = max(
+            0, int(os.environ.get("APC_EXACT_BOUNDARY_ENTRIES", "1"))
+        )
         self.exact_cache_guard_tokens = max(
             1, int(os.environ.get("APC_EXACT_PREFIX_GUARD_TOKENS", "16"))
         )
@@ -3112,12 +3225,33 @@ class APCManager:
             self.stats.matched_tokens += prefix_len
         return prompt_cache, prefix_len
 
+    def _evict_exact_entries(self) -> None:
+        """Trim the exact cache, budgeting media-boundary snapshots separately.
+
+        A boundary snapshot is the conversation head that predates every image.
+        It is re-stored on every turn, but always as the *earliest* store of the
+        turn, so one shared LRU would evict it before the turn that needs it --
+        which is precisely the turn an image leaves the history.
+        """
+        for boundary, limit in (
+            (False, self._exact_cache_max),
+            (True, self._exact_boundary_max),
+        ):
+            keys = [
+                key
+                for key, entry in self._exact_cache.items()
+                if entry.boundary is boundary
+            ]
+            for key in keys[: max(0, len(keys) - limit)]:
+                del self._exact_cache[key]
+
     def store_exact_cache(
         self,
         token_ids: Sequence[int],
         prompt_cache: Sequence[Any],
         *,
         extra_hash: int = 0,
+        boundary: bool = False,
     ) -> bool:
         """Store a full prompt-cache snapshot for exact-prefix reuse."""
         if (self._exact_cache_max <= 0 and self.disk is None) or not token_ids:
@@ -3148,10 +3282,10 @@ class APCManager:
                     extra_hash=int(extra_hash),
                     prompt_cache=copied,
                     last_used=time.time(),
+                    boundary=bool(boundary),
                 )
                 self._exact_cache.move_to_end(key)
-                while len(self._exact_cache) > self._exact_cache_max:
-                    self._exact_cache.popitem(last=False)
+                self._evict_exact_entries()
                 stored = True
         if stored:
             apc_trace(
@@ -3347,8 +3481,7 @@ class APCManager:
                         last_used=time.time(),
                     )
                     self._exact_cache.move_to_end(key)
-                    while len(self._exact_cache) > self._exact_cache_max:
-                        self._exact_cache.popitem(last=False)
+                    self._evict_exact_entries()
                     self.stats.exact_stores += 1
                     layer_major_stored = True
             parent = SEED_PARENT_HASH

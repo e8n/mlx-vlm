@@ -816,6 +816,7 @@ class QueuedGenerationRequest:
     videos: Optional[List] = None
     audio: Optional[List] = None
     apc_semantic_hash: Optional[int] = None
+    apc_media_hashes: Optional[list] = None
     request_id: Optional[str] = None
     queued_at: float = field(default_factory=time.perf_counter)
 
@@ -1199,10 +1200,17 @@ class ResponseGenerator:
         _check_configured_context_budget(prompt_tokens, args.max_tokens)
 
         apc_semantic_hash = None
+        apc_media_hashes = None
         if getattr(self, "apc_mode", None) is not None:
             pixel_values = raw_inputs.get("pixel_values")
+            # With per-image hashes, image identity rides in the APC key tokens
+            # instead of this salt, so a prefix that ends before a later image
+            # stays reusable. Only fall back to the whole-set hash without them.
+            apc_media_hashes = self._apc_media_hashes(raw_inputs, images)
             image_hash = 0
-            if pixel_values is not None:
+            if apc_media_hashes is not None:
+                pass
+            elif pixel_values is not None:
                 image_hash = _apc.hash_image_payload(pixel_values=pixel_values)
             elif images is not None:
                 image_hash = _apc.hash_image_payload(image_ref=images)
@@ -1228,6 +1236,7 @@ class ResponseGenerator:
             videos=videos,
             audio=audio,
             apc_semantic_hash=apc_semantic_hash,
+            apc_media_hashes=apc_media_hashes,
             request_id=request_id,
             queued_at=request_started_at,
         )
@@ -1270,6 +1279,40 @@ class ResponseGenerator:
             image_token_index=image_token_index,
             add_special_tokens=add_special_tokens,
         )
+
+    def _apc_media_hashes(self, raw_inputs: dict, images) -> Optional[list]:
+        """Per-image APC hashes in prompt order, or ``None`` to keep the flat salt.
+
+        One hash per image placeholder span lets the APC key say *which* image
+        sits where, so adding or dropping an image only invalidates prefixes
+        that reach it. Returns ``None`` whenever that mapping cannot be trusted:
+        no images, audio or video in the same prompt (their placeholders share
+        the image token id on some models, so spans stop being one-per-image),
+        or a span count that disagrees with the image count.
+        """
+        if not images or raw_inputs.get("pixel_values") is None:
+            return None
+        if (
+            raw_inputs.get("input_features") is not None
+            or raw_inputs.get("pixel_values_videos") is not None
+        ):
+            return None
+        input_ids = raw_inputs.get("input_ids")
+        if input_ids is None:
+            return None
+        media_token_ids = _apc.multimodal_token_ids_from_config(
+            getattr(self.model, "config", None)
+        )
+        if not media_token_ids:
+            return None
+        try:
+            ids_list = input_ids.reshape(-1).tolist()
+        except Exception:
+            return None
+        spans = _apc.media_token_spans(ids_list, media_token_ids)
+        if len(spans) != len(images):
+            return None
+        return [_apc.hash_image_payload(image_ref=image) for image in images]
 
     def _preprocess_request(self, prompt, images=None, audio=None, videos=None) -> dict:
         if videos is None:
@@ -1577,6 +1620,7 @@ class ResponseGenerator:
         raw_inputs: dict,
         images=None,
         apc_semantic_hash: Optional[int] = None,
+        apc_media_hashes: Optional[list] = None,
     ) -> Tuple[mx.array, dict]:
         """GPU-only: run vision encoder if needed. Must run on GPU thread."""
         input_ids = raw_inputs.get("input_ids")
@@ -1609,6 +1653,8 @@ class ResponseGenerator:
         }
         if apc_semantic_hash is not None:
             gen_kwargs["_apc_semantic_hash"] = apc_semantic_hash
+        if apc_media_hashes:
+            gen_kwargs["_apc_media_hashes"] = tuple(apc_media_hashes)
         return input_ids, gen_kwargs
 
     def _collect_pending_requests(
@@ -1756,6 +1802,7 @@ class ResponseGenerator:
                         raw_inputs,
                         images,
                         apc_semantic_hash=request.apc_semantic_hash,
+                        apc_media_hashes=request.apc_media_hashes,
                     )
                     has_embeds = bool(gen_kwargs.get("inputs_embeds") is not None)
                     # Preserve tenant isolation for manually queued requests
@@ -2021,6 +2068,7 @@ class ResponseGenerator:
                         raw_inputs,
                         images,
                         apc_semantic_hash=request.apc_semantic_hash,
+                        apc_media_hashes=request.apc_media_hashes,
                     )
                     uid = id(rqueue)
                     uids.append(uid)
