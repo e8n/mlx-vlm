@@ -142,7 +142,7 @@ class Model(nn.Module):
         if sub.startswith("attn."):
             name, leaf = sub[len("attn.") :].rsplit(".", 1)
             if name in self._ATTN:
-                out[base + f"self_attn.{self._ATTN[name]}.weight"] = v
+                out[base + f"self_attn.{self._ATTN[name]}.{leaf}"] = v
             elif name in ("q_norm", "k_norm"):
                 out[base + f"self_attn.{name}.weight"] = v
             elif name in ("k_sconv", "v_sconv"):
