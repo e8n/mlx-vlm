@@ -180,6 +180,20 @@ class Model(nn.Module):
                 out[p + "up_proj.weight"] = u
             elif m == "w2_md.weight":
                 out[p + "down_proj.weight"] = v
+            elif m.startswith("experts.") and m.split(".")[1] in (
+                "gate_proj",
+                "up_proj",
+                "down_proj",
+            ):
+                # Routed experts arriving pre-split (gate/up already separate,
+                # not fused w13) and, when quantized, in plain MLX affine
+                # layout (weight/scales/biases) rather than NVFP4 w13/w2
+                # sidecars. Already [E, out, in]-stacked, matching
+                # InklingSwitchGLU's own gate_proj/up_proj/down_proj
+                # SwitchLinear parameters 1:1 — no _map_experts buffering,
+                # gate/up split, or descale needed; gate_scale/out_scale stay
+                # at InklingSwitchGLU's default all-ones.
+                out[p + "switch_mlp." + m[len("experts.") :]] = v
             else:
                 out[p + m] = v
         else:
@@ -244,10 +258,18 @@ class Model(nn.Module):
                     continue
                 experts.setdefault(i, {}).setdefault(which, {})[leaf] = v
                 continue
-            if k == "model.llm.embed.weight":
-                out["language_model.model.embed_tokens.weight"] = v
-            elif k == "model.llm.unembed.weight":
-                out["language_model.lm_head.weight"] = v
+            if k.startswith("model.llm.embed.") and k.rsplit(".", 1)[1] in (
+                "weight",
+                "scales",
+                "biases",
+            ):
+                out["language_model.model.embed_tokens." + k.rsplit(".", 1)[1]] = v
+            elif k.startswith("model.llm.unembed.") and k.rsplit(".", 1)[1] in (
+                "weight",
+                "scales",
+                "biases",
+            ):
+                out["language_model.lm_head." + k.rsplit(".", 1)[1]] = v
             elif k in ("model.llm.embed_norm.weight", "model.llm.norm.weight"):
                 out["language_model.model." + k[len("model.llm.") :]] = v
             elif k.startswith("model.llm.layers."):
@@ -267,8 +289,12 @@ class Model(nn.Module):
                     out["vision_tower." + sub] = v
             elif k.startswith("model.audio."):
                 sub = k[len("model.audio.") :]
-                if sub == "encoder.weight":
-                    out["audio_tower.embed_audio_tokens.weight"] = v
+                if sub.startswith("encoder.") and sub.rsplit(".", 1)[1] in (
+                    "weight",
+                    "scales",
+                    "biases",
+                ):
+                    out["audio_tower.embed_audio_tokens." + sub.rsplit(".", 1)[1]] = v
                 elif sub == "final_norm.weight":
                     out["audio_tower.norm.weight"] = v
                 else:
