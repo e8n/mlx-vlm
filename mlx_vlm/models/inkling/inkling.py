@@ -137,6 +137,16 @@ class Model(nn.Module):
         "wo_ud": "o_proj",
     }
 
+    @staticmethod
+    def _sconv_to_mlx(v):
+        """Depthwise short-conv weights arrive in either PyTorch layout
+        ``(channels, 1, kernel)`` (e.g. thinkingmachines/Inkling-Small-NVFP4)
+        or already-MLX layout ``(channels, kernel, 1)`` (e.g. third-party MLX
+        repacks such as pipenetwork/Inkling-Small-MLX-4bit). Both have exactly
+        one size-1 axis among the last two; only transpose when that axis is
+        the kernel one, i.e. PyTorch layout."""
+        return v.transpose(0, 2, 1) if v.shape[1] == 1 else v
+
     def _map_llm_layer(self, base, sub, v):
         out = {}
         if sub.startswith("attn."):
@@ -146,7 +156,7 @@ class Model(nn.Module):
             elif name in ("q_norm", "k_norm"):
                 out[base + f"self_attn.{name}.weight"] = v
             elif name in ("k_sconv", "v_sconv"):
-                out[base + f"self_attn.{name}.conv.weight"] = v.transpose(0, 2, 1)
+                out[base + f"self_attn.{name}.conv.weight"] = self._sconv_to_mlx(v)
             elif name == "rel_logits_proj":
                 out[base + "self_attn.rel_proj"] = v
             else:
@@ -156,9 +166,9 @@ class Model(nn.Module):
         elif sub == "mlp_norm.weight":
             out[base + "post_attention_layernorm.weight"] = v
         elif sub == "attn_sconv.weight":
-            out[base + "attn_sconv.conv.weight"] = v.transpose(0, 2, 1)
+            out[base + "attn_sconv.conv.weight"] = self._sconv_to_mlx(v)
         elif sub == "mlp_sconv.weight":
-            out[base + "mlp_sconv.conv.weight"] = v.transpose(0, 2, 1)
+            out[base + "mlp_sconv.conv.weight"] = self._sconv_to_mlx(v)
         elif sub.startswith("mlp."):
             m = sub[len("mlp.") :]
             p = base + "mlp."
@@ -190,10 +200,17 @@ class Model(nn.Module):
                 # layout (weight/scales/biases) rather than NVFP4 w13/w2
                 # sidecars. Already [E, out, in]-stacked, matching
                 # InklingSwitchGLU's own gate_proj/up_proj/down_proj
-                # SwitchLinear parameters 1:1 — no _map_experts buffering,
-                # gate/up split, or descale needed; gate_scale/out_scale stay
-                # at InklingSwitchGLU's default all-ones.
-                out[p + "switch_mlp." + m[len("experts.") :]] = v
+                # SwitchLinear parameters 1:1 — no _map_experts buffering or
+                # gate/up split needed. gate_scale/out_scale (NVFP4-only)
+                # default to all-ones in InklingSwitchGLU.__init__, but
+                # strict load_weights still requires the keys present, so
+                # supply them explicitly (once per layer, off any one leaf).
+                proj, leaf = m[len("experts.") :].split(".")
+                out[p + f"switch_mlp.{proj}.{leaf}"] = v
+                if proj == "down_proj" and leaf == "weight":
+                    n = v.shape[0]
+                    out[p + "switch_mlp.gate_scale"] = mx.ones((n,))
+                    out[p + "switch_mlp.out_scale"] = mx.ones((n,))
             else:
                 out[p + m] = v
         else:
@@ -280,8 +297,9 @@ class Model(nn.Module):
             elif k.startswith("model.visual."):
                 sub = k[len("model.visual.") :]
                 if sub.startswith("layers.linear_"):
-                    j = sub[len("layers.linear_") :].split(".")[0]
-                    out[f"vision_tower.encoder_layers.{j}.projection.weight"] = v
+                    rest = sub[len("layers.linear_") :]
+                    j, leaf = rest.split(".", 1)
+                    out[f"vision_tower.encoder_layers.{j}.projection.{leaf}"] = v
                 elif sub.startswith("layers.norm_"):
                     j = sub[len("layers.norm_") :].split(".")[0]
                     out[f"vision_tower.encoder_layers.{j}.layer_norm.weight"] = v
