@@ -16,6 +16,7 @@ from mlx_vlm.models.text_only import TextOnlyModel
 from mlx_vlm.utils import (
     StoppingCriteria,
     _load_safetensors,
+    _materialize_raw_weights,
     apply_generation_config_defaults,
     get_model_and_args,
     load,
@@ -606,6 +607,71 @@ def test_load_model_forwards_strict_to_load_weights():
 
     assert model.loaded_weights == list(weights.items())
     assert model.loaded_strict is False
+
+
+def _fake_model_class_recording_sanitize(events):
+    class FakeConfig:
+        @classmethod
+        def from_dict(cls, config):
+            return cls()
+
+    class FakeModel(nn.Module):
+        def __init__(self, config):
+            super().__init__()
+            self.config = config
+
+        def sanitize(self, weights):
+            events.append("sanitize")
+            return weights
+
+        def load_weights(self, weights, strict=True):
+            self.loaded_weights = weights
+
+    return SimpleNamespace(ModelConfig=FakeConfig, Model=FakeModel)
+
+
+@pytest.mark.parametrize("lazy", [False, True])
+def test_load_model_materializes_raw_weights_before_sanitize(lazy):
+    """Eager loads must read the checkpoint on the CPU stream *before* sanitize
+    stacks GPU ops on it; otherwise the Metal command buffer waits on disk I/O
+    and the GPU watchdog kills a slow (cold HDD) load. Lazy loads keep the
+    deferred reads."""
+    events = []
+    weights = {"weight": mx.zeros((1,), dtype=mx.float16)}
+
+    def record_materialize(w):
+        events.append(("materialize", w))
+
+    with (
+        patch("mlx_vlm.utils.load_config", return_value={"model_type": "fake"}),
+        patch("mlx_vlm.utils.glob.glob", return_value=["/tmp/model/model.safetensors"]),
+        patch("mlx_vlm.utils._load_safetensors", return_value=weights),
+        patch("mlx_vlm.utils._materialize_raw_weights", side_effect=record_materialize),
+        patch(
+            "mlx_vlm.utils.get_model_and_args",
+            return_value=(_fake_model_class_recording_sanitize(events), "fake"),
+        ),
+    ):
+        load_model(Path("/tmp/model"), lazy=lazy, strict=False)
+
+    if lazy:
+        assert events == ["sanitize"]
+    else:
+        assert events == [("materialize", weights), "sanitize"]
+
+
+def test_materialize_raw_weights_evaluates_every_array():
+    a = mx.zeros((4,)) + 1
+    b = mx.ones((2, 2)) * 3
+    weights = {"a": a, "b": b, "meta": "not-an-array"}
+
+    with patch("mlx_vlm.utils.mx.eval", wraps=mx.eval) as eval_spy:
+        _materialize_raw_weights(weights)
+
+    eval_spy.assert_called_once()
+    called = eval_spy.call_args.args
+    assert len(called) == 2
+    assert all(isinstance(x, mx.array) for x in called)
 
 
 def test_load_safetensors_reinterprets_f8_e8m0_header(tmp_path):

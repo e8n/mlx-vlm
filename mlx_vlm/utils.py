@@ -606,6 +606,31 @@ def get_model_path(
     return model_path
 
 
+def _materialize_raw_weights(weights: Dict[str, mx.array]) -> None:
+    """Read every checkpoint tensor into memory before any transform touches it.
+
+    ``mx.load`` is lazy: each tensor is a CPU-stream ``Load`` that only hits the
+    disk when evaluated. A model's ``sanitize`` then stacks GPU-stream ops on top
+    of those loads (row-concat for fused projections, transposes, de-interleaves,
+    ...). When ``load_model`` finally evaluates ``model.parameters()``, MLX
+    resolves the cross-stream dependency *inside the Metal command buffer*: the
+    GPU is told to wait for the CPU read to finish. macOS's GPU watchdog kills a
+    command buffer that stays in flight for more than a few seconds, so a
+    checkpoint whose reads are slow -- an external HDD with a cold page cache
+    delivers ~150-200 MB/s -- dies with ``[METAL] Command buffer execution
+    failed: Caused GPU Timeout Error (kIOGPUCommandBufferCallbackErrorTimeout)``
+    (pipenetwork/Inkling-Small-MLX-4bit, 138 GB: 5/5 launches; the same load
+    succeeds when the page cache is warm, which is why it looked intermittent).
+
+    Evaluating the raw loads first keeps the slow I/O entirely on the CPU stream,
+    where nothing on the GPU waits for it. As a side effect the shards are read
+    in header order rather than parameter-tree order, which is kinder to a
+    spinning disk. Peak memory is unchanged: the transforms consume the raw
+    arrays exactly as before and MLX frees each one once its consumer has run.
+    """
+    mx.eval(*[v for v in weights.values() if isinstance(v, mx.array)])
+
+
 def load_model(model_path: Path, lazy: bool = False, **kwargs) -> nn.Module:
     """
     Load and initialize the model from a given path.
@@ -676,6 +701,11 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
     weights = {}
     for wf in weight_files:
         weights.update(_load_safetensors(wf))
+
+    if not lazy:
+        # Must happen before sanitize() builds GPU ops over these loads; see
+        # _materialize_raw_weights for the GPU-watchdog failure it prevents.
+        _materialize_raw_weights(weights)
 
     model_class, _ = get_model_and_args(config=config)
 
